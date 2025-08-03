@@ -11,6 +11,7 @@ import threading  # For concurrent audio processing and UI updates
 import queue  # Thread-safe communication between audio processing and UI
 import time
 import os
+import gc  # For explicit garbage collection
 import json  # For settings file format
 import base64  # For encoding encrypted data
 import tempfile  # For temporary audio files during processing
@@ -1084,6 +1085,10 @@ class SubtitleApp:
             if frames and self.is_recording:
                 print("🔄 [RECORD] Submitting audio chunk to processing queue")
                 self.audio_task_queue.put(frames)
+            elif frames and not self.is_recording:
+                # Clean up frames if recording was stopped
+                frames.clear()
+                print("🧹 [MEMORY] Cleaned up unsent frames due to recording stop")
         
         # Clean up audio stream
         stream.stop_stream()
@@ -1155,6 +1160,10 @@ class SubtitleApp:
         
         if rms_volume < voice_threshold:
             print("🤫 [AUDIO] Audio level too low - likely silence or background noise. Skipping transcription.")
+            # Clean up audio data before returning
+            del audio_data
+            frames.clear()
+            gc.collect()
             return
         
         # Create temporary WAV file for Whisper processing
@@ -1167,6 +1176,11 @@ class SubtitleApp:
             wf.writeframes(b''.join(frames))  # Combine all audio chunks
             wf.close()
             
+            # Clean up original audio data and frames after WAV file creation
+            del audio_data
+            frames.clear()
+            print(f"🧹 [MEMORY] Cleaned up original audio data and frames")
+            
             print(f"📂 [AUDIO] Temporary wav file created: {tmp_file.name}")
             
             try:
@@ -1176,6 +1190,10 @@ class SubtitleApp:
                 filtered_audio = bandpass_filter(audio_data, 300.0, 3000.0, sample_rate)
                 wavfile.write(tmp_file.name, sample_rate, np.int16(filtered_audio))
                 print("✅ [AUDIO] Band-pass filtering completed")
+                
+                # Clean up filtering audio data
+                del audio_data, filtered_audio
+                print("🧹 [MEMORY] Cleaned up filtering audio arrays")
                 
                 # Run Whisper transcription
                 print("🤖 [AUDIO] Calling whisper transcribe...")
@@ -1192,9 +1210,12 @@ class SubtitleApp:
             except Exception as e:
                 print(f"❗Error processing audio: {e}")
             finally:
-                # Always clean up temporary file
+                # Always clean up temporary file and force garbage collection
                 print(f"🗑️ [AUDIO] Removing temp file {tmp_file.name}")
                 os.remove(tmp_file.name)
+                # Force garbage collection to free memory immediately
+                gc.collect()
+                print("🧹 [MEMORY] Forced garbage collection completed")
 
     def translation_worker(self):
         """
