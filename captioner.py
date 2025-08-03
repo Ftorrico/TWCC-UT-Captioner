@@ -24,7 +24,7 @@ import pyaudio  # Low-level audio capture from microphone
 import numpy as np  # Numerical operations for audio data
 from cryptography.fernet import Fernet  # Symmetric encryption for API key storage
 from openai import OpenAI  # OpenAI API client for translation services
-from concurrent.futures import ThreadPoolExecutor  # Thread pool for audio processing
+from concurrent.futures import ThreadPoolExecutor, as_completed  # Thread pool for audio processing
 from scipy.signal import butter, lfilter  # For band-pass filtering
 from scipy.io import wavfile  # For reading/writing filtered audio
 
@@ -437,10 +437,10 @@ class SubtitleApp:
         print("🎵 [INIT] Initializing PyAudio 🎶")
         self.audio = pyaudio.PyAudio()  # Audio interface
         
-        # Thread-safe queues for inter-thread communication
-        self.text_queue = queue.Queue()  # UI updates (processed text to display)
-        self.audio_task_queue = queue.Queue()  # Audio chunks for processing
-        self.translation_task_queue = queue.Queue()  # Text for translation
+        # Thread-safe queues for inter-thread communication with size limits
+        self.text_queue = queue.Queue(maxsize=10)  # UI updates (processed text to display)
+        self.audio_task_queue = queue.Queue(maxsize=5)  # Audio chunks for processing (limit memory usage)
+        self.translation_task_queue = queue.Queue(maxsize=10)  # Text for translation
         
         # Application state
         self.is_recording = False  # Recording state flag
@@ -532,9 +532,26 @@ class SubtitleApp:
         self.update_thread = threading.Thread(target=self.update_text_loop, daemon=True)
         self.update_thread.start()
         
-        print("🧵 [INIT] Starting audio processing thread pool")
-        # Thread pool for CPU-intensive audio processing
-        self.audio_executor = ThreadPoolExecutor(max_workers=1)
+        print("🧵 [INIT] Setting up optimized thread pools")
+        # Calculate optimal worker counts based on CPU cores
+        cpu_cores = os.cpu_count() or 1
+        
+        # Audio processing pool - CPU intensive operations (Whisper, filtering)
+        # Use 1-2 workers max to avoid overwhelming CPU with audio processing
+        self.audio_executor = ThreadPoolExecutor(
+            max_workers=min(2, max(1, cpu_cores // 2)),
+            thread_name_prefix="AudioProcessor"
+        )
+        
+        # I/O operations pool - File operations, network calls (OpenAI API)
+        # Can handle more concurrent I/O operations
+        self.io_executor = ThreadPoolExecutor(
+            max_workers=min(4, max(2, cpu_cores)),
+            thread_name_prefix="IOProcessor"
+        )
+        
+        print(f"🧵 [INIT] Audio pool: {self.audio_executor._max_workers} workers, I/O pool: {self.io_executor._max_workers} workers")
+        
         # Worker thread that monitors audio queue and submits processing jobs
         self.audio_processing_thread = threading.Thread(target=self.audio_worker, daemon=True)
         self.audio_processing_thread.start()
@@ -1084,7 +1101,12 @@ class SubtitleApp:
             # Submit complete chunk for processing (if recording is still active)
             if frames and self.is_recording:
                 print("🔄 [RECORD] Submitting audio chunk to processing queue")
-                self.audio_task_queue.put(frames)
+                try:
+                    # Non-blocking put with timeout to prevent recording thread blocking
+                    self.audio_task_queue.put(frames, timeout=1.0)
+                except queue.Full:
+                    print("⚠️ [RECORD] Audio processing queue full, dropping chunk to prevent blocking")
+                    frames.clear()  # Free memory from dropped chunk
             elif frames and not self.is_recording:
                 # Clean up frames if recording was stopped
                 frames.clear()
@@ -1097,29 +1119,48 @@ class SubtitleApp:
 
     def audio_worker(self):
         """
-        Audio processing worker thread.
+        Enhanced audio processing worker thread with task prioritization and error handling.
         
         This thread:
         1. Monitors the audio task queue for new audio chunks
-        2. Submits each chunk to the thread pool for processing
-        3. Runs continuously until application shutdown
+        2. Submits each chunk to the optimized thread pool for processing
+        3. Tracks submitted tasks and handles completion/errors
+        4. Runs continuously until application shutdown
         
-        Using a thread pool allows for potentially parallel processing
-        of multiple audio chunks if needed in the future.
+        Uses enhanced thread pool management with proper task tracking.
         """
-        print("🛠️ [AUDIO] Audio worker thread started")
+        print("🛠️ [AUDIO] Enhanced audio worker thread started")
+        submitted_tasks = []  # Track submitted futures for monitoring
         
         while True:
-            # Wait for audio chunk from recording thread
-            frames = self.audio_task_queue.get()
-            
-            if frames is None:  # Shutdown signal
-                print("🛑 [AUDIO] Audio worker thread exiting")
-                break
-            
-            print("🛠️ [AUDIO] Processing frames from queue")
-            # Submit to thread pool for processing
-            self.audio_executor.submit(self.process_audio, frames)
+            try:
+                # Wait for audio chunk from recording thread with timeout
+                frames = self.audio_task_queue.get(timeout=1.0)
+                
+                if frames is None:  # Shutdown signal
+                    print("🛑 [AUDIO] Audio worker thread exiting")
+                    break
+                
+                print("🛠️ [AUDIO] Processing frames from queue")
+                
+                # Submit to audio processing thread pool
+                future = self.audio_executor.submit(self.process_audio, frames)
+                submitted_tasks.append(future)
+                
+                # Clean up completed tasks to prevent memory buildup
+                submitted_tasks = [task for task in submitted_tasks if not task.done()]
+                
+                # Log active task count for monitoring
+                if len(submitted_tasks) > 0:
+                    print(f"🔄 [AUDIO] Active processing tasks: {len(submitted_tasks)}")
+                
+            except queue.Empty:
+                # Timeout is normal, check for completed tasks
+                submitted_tasks = [task for task in submitted_tasks if not task.done()]
+                continue
+            except Exception as e:
+                print(f"❌ [AUDIO] Error in audio worker: {e}")
+                # Continue processing other tasks
 
     def process_audio(self, frames):
         """
@@ -1219,37 +1260,79 @@ class SubtitleApp:
 
     def translation_worker(self):
         """
-        Translation worker thread.
+        Enhanced translation worker thread using I/O thread pool.
         
         This thread:
         1. Monitors the translation task queue for text to process
-        2. Formats and translates text using OpenAI GPT
-        3. Submits processed text to UI queue for display
+        2. Submits translation tasks to I/O thread pool for OpenAI API calls
+        3. Handles completed translations and submits to UI queue
         4. Runs continuously until application shutdown
         
-        Separating translation into its own thread prevents OpenAI API
-        calls from blocking audio processing or UI updates.
+        Uses separate I/O thread pool to handle multiple concurrent API calls
+        without blocking the main translation worker thread.
         """
-        print("🌐 [TRANSLATE] Translation worker thread started")
+        print("🌐 [TRANSLATE] Enhanced translation worker thread started")
+        active_futures = []  # Track active translation futures
         
         while True:
-            # Wait for text from audio processing
-            text = self.translation_task_queue.get()
-            
-            if text is None:  # Shutdown signal
-                print("🛑 [TRANSLATE] Translation worker exiting")
-                break
-            
-            print(f"🌐 [TRANSLATE] Processing text for translation: '{text}'")
-            
-            # Process text through OpenAI
-            translated = self.format_and_translate_sync(text)
-            
-            if translated:
-                print(f"📬 [TRANSLATE] Putting translated text in UI queue: '{translated}'")
-                self.text_queue.put(translated)  # Send to UI for display
-            else:
-                print("😿 [TRANSLATE] No translated text returned")
+            try:
+                # Wait for text from audio processing with timeout
+                text = self.translation_task_queue.get(timeout=0.5)
+                
+                if text is None:  # Shutdown signal
+                    print("🛑 [TRANSLATE] Translation worker exiting")
+                    break
+                
+                print(f"🌐 [TRANSLATE] Submitting text for translation: '{text[:50]}{'...' if len(text) > 50 else ''}'")
+                
+                # Submit to I/O thread pool for API call
+                future = self.io_executor.submit(self.format_and_translate_sync, text)
+                active_futures.append((future, text))
+                
+                # Process completed translations
+                completed_futures = []
+                for future, original_text in active_futures:
+                    if future.done():
+                        try:
+                            translated = future.result()
+                            if translated:
+                                print(f"📬 [TRANSLATE] Putting translated text in UI queue: '{translated[:50]}{'...' if len(translated) > 50 else ''}'")
+                                self.text_queue.put(translated, timeout=2.0)  # Prevent blocking
+                            else:
+                                print("😿 [TRANSLATE] No translated text returned")
+                        except Exception as e:
+                            print(f"❌ [TRANSLATE] Translation error: {e}")
+                        completed_futures.append((future, original_text))
+                
+                # Remove completed futures
+                for completed in completed_futures:
+                    active_futures.remove(completed)
+                
+                # Log active translation count
+                if len(active_futures) > 0:
+                    print(f"🔄 [TRANSLATE] Active translations: {len(active_futures)}")
+                
+            except queue.Empty:
+                # Timeout is normal, process any completed translations
+                completed_futures = []
+                for future, original_text in active_futures:
+                    if future.done():
+                        try:
+                            translated = future.result()
+                            if translated:
+                                self.text_queue.put(translated, timeout=2.0)
+                                print(f"📬 [TRANSLATE] Completed delayed translation")
+                        except Exception as e:
+                            print(f"❌ [TRANSLATE] Translation error: {e}")
+                        completed_futures.append((future, original_text))
+                
+                for completed in completed_futures:
+                    active_futures.remove(completed)
+                continue
+                
+            except Exception as e:
+                print(f"❌ [TRANSLATE] Error in translation worker: {e}")
+                continue
 
     def format_and_translate_sync(self, text):
         """
@@ -1503,12 +1586,35 @@ EFFICIENCY METRICS:
         # Terminate audio system
         self.audio.terminate()
         
+        # Enhanced thread pool shutdown with proper lifecycle management
+        print("🔄 [CLEANUP] Shutting down thread pools...")
+        
         # Shut down audio worker and thread pool
-        self.audio_task_queue.put(None)  # Send shutdown signal
-        self.audio_executor.shutdown(wait=False)
+        try:
+            self.audio_task_queue.put(None, timeout=2.0)  # Send shutdown signal
+            print("📤 [CLEANUP] Sent shutdown signal to audio worker")
+        except queue.Full:
+            print("⚠️ [CLEANUP] Audio queue full, forcing shutdown")
         
         # Shut down translation worker
-        self.translation_task_queue.put(None)  # Send shutdown signal
+        try:
+            self.translation_task_queue.put(None, timeout=2.0)  # Send shutdown signal
+            print("📤 [CLEANUP] Sent shutdown signal to translation worker")
+        except queue.Full:
+            print("⚠️ [CLEANUP] Translation queue full, forcing shutdown")
+        
+        # Shutdown thread pools with timeout
+        print("⏳ [CLEANUP] Waiting for audio thread pool shutdown...")
+        self.audio_executor.shutdown(wait=True, timeout=5.0)  # Wait up to 5 seconds
+        print("✅ [CLEANUP] Audio thread pool shut down")
+        
+        print("⏳ [CLEANUP] Waiting for I/O thread pool shutdown...")
+        self.io_executor.shutdown(wait=True, timeout=5.0)  # Wait up to 5 seconds
+        print("✅ [CLEANUP] I/O thread pool shut down")
+        
+        # Force garbage collection to clean up thread resources
+        gc.collect()
+        print("🧹 [CLEANUP] Final garbage collection completed")
 
 
 def main():
