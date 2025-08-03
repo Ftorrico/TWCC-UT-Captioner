@@ -20,6 +20,7 @@ import wave  # For audio file creation and manipulation
 
 # Audio processing and AI imports
 import whisper  # OpenAI's speech-to-text model
+import torch  # For GPU device detection and management
 import pyaudio  # Low-level audio capture from microphone
 import numpy as np  # Numerical operations for audio data
 from cryptography.fernet import Fernet  # Symmetric encryption for API key storage
@@ -417,15 +418,15 @@ class SubtitleApp:
         self.client = None
         self.init_openai_client()
 
-        # Whisper model initialization for speech-to-text
-        try:
-            print("🎤 [INIT] Loading Whisper model... 🕗")
-            # Load base model (good balance of speed vs accuracy for real-time use)
-            self.whisper_model = whisper.load_model("base")
-            print("✅ [INIT] Whisper model loaded successfully!")
-        except Exception as e:
-            print(f"❌ [INIT] Failed to load Whisper model: {e}")
-            self.whisper_model = None
+        # Enhanced Whisper model management system
+        self.whisper_model = None  # Lazy loading - model loaded when first needed
+        self.whisper_model_size = "base"  # Default model size
+        self.whisper_device = self._detect_optimal_device()  # Auto-detect best device
+        self.model_load_lock = threading.Lock()  # Thread-safe model loading
+        self.model_last_used = None  # Track model usage for memory management
+        
+        print(f"🎤 [INIT] Whisper model management initialized (device: {self.whisper_device})")
+        print("🔄 [INIT] Model will be loaded on first use (lazy loading)")
 
         # Audio capture configuration
         self.CHUNK = 1024  # Audio buffer size (smaller = more responsive, larger = more efficient)
@@ -560,6 +561,230 @@ class SubtitleApp:
         # Translation worker thread - handles OpenAI API calls
         self.translation_worker_thread = threading.Thread(target=self.translation_worker, daemon=True)
         self.translation_worker_thread.start()
+        
+        # Start model memory management monitoring
+        self.start_model_monitoring()
+
+    def _detect_optimal_device(self):
+        """
+        Detect the optimal device for Whisper model execution.
+        
+        Returns:
+            str: Device string ('cuda', 'mps', or 'cpu')
+        """
+        try:
+            # Check for CUDA (NVIDIA GPU)
+            if torch.cuda.is_available():
+                device_name = torch.cuda.get_device_name(0)
+                print(f"🚀 [DEVICE] CUDA GPU detected: {device_name}")
+                return "cuda"
+            
+            # Check for Apple Silicon GPU (M1/M2 Macs)
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                print("🚀 [DEVICE] Apple Metal Performance Shaders (MPS) detected")
+                return "mps"
+            
+            # Fallback to CPU
+            else:
+                cpu_count = os.cpu_count()
+                print(f"💻 [DEVICE] Using CPU with {cpu_count} cores")
+                return "cpu"
+                
+        except Exception as e:
+            print(f"⚠️ [DEVICE] Error detecting device, falling back to CPU: {e}")
+            return "cpu"
+
+    def _get_model_info(self, model_size):
+        """
+        Get information about Whisper model sizes.
+        
+        Args:
+            model_size (str): Model size identifier
+            
+        Returns:
+            dict: Model information including memory usage and speed
+        """
+        model_info = {
+            "tiny": {
+                "params": "39M",
+                "vram": "~1GB",
+                "speed": "~32x realtime",
+                "accuracy": "Basic",
+                "description": "Fastest, lowest memory usage"
+            },
+            "base": {
+                "params": "74M", 
+                "vram": "~1GB",
+                "speed": "~16x realtime",
+                "accuracy": "Good",
+                "description": "Balanced speed and accuracy"
+            },
+            "small": {
+                "params": "244M",
+                "vram": "~2GB", 
+                "speed": "~6x realtime",
+                "accuracy": "Better",
+                "description": "Higher accuracy, slower"
+            },
+            "medium": {
+                "params": "769M",
+                "vram": "~5GB",
+                "speed": "~2x realtime", 
+                "accuracy": "High",
+                "description": "Best accuracy, slowest"
+            }
+        }
+        return model_info.get(model_size, model_info["base"])
+
+    def _load_whisper_model(self, model_size=None, force_reload=False):
+        """
+        Load or reload Whisper model with specified size and device.
+        
+        Args:
+            model_size (str): Model size to load (tiny/base/small/medium)
+            force_reload (bool): Force reload even if model is already loaded
+            
+        Returns:
+            bool: True if model loaded successfully, False otherwise
+        """
+        with self.model_load_lock:
+            model_size = model_size or self.whisper_model_size
+            
+            # Check if model is already loaded and correct
+            if (self.whisper_model is not None and 
+                not force_reload and 
+                hasattr(self, '_current_model_size') and 
+                self._current_model_size == model_size):
+                print(f"✅ [MODEL] Whisper {model_size} model already loaded")
+                return True
+            
+            try:
+                # Unload previous model to free memory
+                if self.whisper_model is not None:
+                    print(f"🗑️ [MODEL] Unloading previous Whisper model")
+                    del self.whisper_model
+                    gc.collect()
+                    if self.whisper_device == "cuda":
+                        torch.cuda.empty_cache()
+                
+                # Get model info for logging
+                info = self._get_model_info(model_size)
+                print(f"🎤 [MODEL] Loading Whisper '{model_size}' model...")
+                print(f"📊 [MODEL] {info['description']} - {info['params']} parameters")
+                print(f"⚡ [MODEL] Expected speed: {info['speed']}, Memory: {info['vram']}")
+                
+                start_time = time.time()
+                
+                # Load model with device specification
+                self.whisper_model = whisper.load_model(
+                    model_size, 
+                    device=self.whisper_device
+                )
+                
+                load_time = time.time() - start_time
+                self._current_model_size = model_size
+                self.whisper_model_size = model_size
+                self.model_last_used = time.time()
+                
+                print(f"✅ [MODEL] Whisper '{model_size}' model loaded successfully!")
+                print(f"⏱️ [MODEL] Load time: {load_time:.2f} seconds")
+                print(f"🎯 [MODEL] Device: {self.whisper_device}")
+                
+                return True
+                
+            except Exception as e:
+                print(f"❌ [MODEL] Failed to load Whisper '{model_size}' model: {e}")
+                self.whisper_model = None
+                return False
+
+    def get_whisper_model(self):
+        """
+        Get the Whisper model, loading it lazily if needed.
+        
+        Returns:
+            whisper.Whisper: The loaded Whisper model, or None if loading failed
+        """
+        if self.whisper_model is None:
+            print("🔄 [MODEL] Lazy loading Whisper model...")
+            if not self._load_whisper_model():
+                return None
+        
+        # Update last used timestamp
+        self.model_last_used = time.time()
+        return self.whisper_model
+
+    def change_model_size(self, new_size):
+        """
+        Change the Whisper model size.
+        
+        Args:
+            new_size (str): New model size (tiny/base/small/medium)
+            
+        Returns:
+            bool: True if model changed successfully
+        """
+        if new_size not in ["tiny", "base", "small", "medium"]:
+            print(f"❌ [MODEL] Invalid model size: {new_size}")
+            return False
+        
+        print(f"🔄 [MODEL] Changing model size from '{self.whisper_model_size}' to '{new_size}'")
+        return self._load_whisper_model(new_size, force_reload=True)
+
+    def unload_model_if_idle(self, idle_threshold_minutes=10):
+        """
+        Unload model if it hasn't been used for the specified time.
+        
+        Args:
+            idle_threshold_minutes (int): Minutes of inactivity before unloading
+        """
+        if (self.whisper_model is not None and 
+            self.model_last_used is not None and
+            time.time() - self.model_last_used > (idle_threshold_minutes * 60)):
+            
+            print(f"🗑️ [MODEL] Unloading idle Whisper model (unused for {idle_threshold_minutes} minutes)")
+            with self.model_load_lock:
+                del self.whisper_model
+                self.whisper_model = None
+                gc.collect()
+                if self.whisper_device == "cuda":
+                    torch.cuda.empty_cache()
+            print("✅ [MODEL] Model unloaded to free memory")
+
+    def start_model_monitoring(self):
+        """
+        Start background monitoring for model memory management.
+        
+        Periodically checks if the model should be unloaded due to inactivity.
+        """
+        def model_monitor():
+            while True:
+                try:
+                    time.sleep(300)  # Check every 5 minutes
+                    self.unload_model_if_idle(idle_threshold_minutes=10)
+                except Exception as e:
+                    print(f"❌ [MODEL] Error in model monitoring: {e}")
+        
+        monitor_thread = threading.Thread(target=model_monitor, daemon=True)
+        monitor_thread.start()
+        print("🔍 [MODEL] Started model memory monitoring (checks every 5 minutes)")
+
+    def process_audio_batch(self, audio_chunks):
+        """
+        Process multiple audio chunks in a batch for improved efficiency.
+        
+        Args:
+            audio_chunks (list): List of audio frame lists to process together
+            
+        Note: Currently processes chunks individually, but could be optimized
+        for true batch processing in the future.
+        """
+        print(f"🔄 [BATCH] Processing batch of {len(audio_chunks)} audio chunks")
+        
+        for i, frames in enumerate(audio_chunks):
+            print(f"🔄 [BATCH] Processing chunk {i+1}/{len(audio_chunks)}")
+            self.process_audio(frames)
+            
+        print(f"✅ [BATCH] Completed batch processing of {len(audio_chunks)} chunks")
 
     def init_openai_client(self):
         """
@@ -703,6 +928,20 @@ class SubtitleApp:
                                     width=10,
                                     command=self.on_timeout_changed)
         timeout_spinner.grid(row=1, column=3, padx=5, sticky=tk.W)
+        
+        # Model size selection for performance tuning
+        ttk.Label(control_frame, text="Model Size:").grid(row=1, column=4, padx=5, sticky=tk.W)
+        self.model_size = tk.StringVar(value=self.whisper_model_size)
+        model_sizes = ["tiny", "base", "small", "medium"]
+        model_menu = ttk.Combobox(control_frame, textvariable=self.model_size, 
+                                 values=model_sizes, width=8, state="readonly")
+        model_menu.grid(row=1, column=5, padx=5, sticky=tk.W)
+        model_menu.bind('<<ComboboxSelected>>', self.on_model_size_changed)
+        
+        # Model info button
+        model_info_button = ttk.Button(control_frame, text="ℹ️", width=3,
+                                     command=self.show_model_info)
+        model_info_button.grid(row=1, column=6, padx=2, sticky=tk.W)
         
         # Main subtitle display area
         self.text_frame = tk.Frame(self.root, bg="black", height=150)
@@ -913,6 +1152,57 @@ class SubtitleApp:
         
         # Save preferences
         self.save_ui_preferences()
+    
+    def on_model_size_changed(self, event=None):
+        """
+        Handle Whisper model size changes.
+        
+        Called when user selects a different model size from the dropdown.
+        """
+        new_size = self.model_size.get()
+        print(f"🎤 [UI] Model size change requested: {new_size}")
+        
+        if new_size != self.whisper_model_size:
+            info = self._get_model_info(new_size)
+            print(f"📊 [UI] Changing to {new_size} model: {info['description']}")
+            
+            # Change model in background to avoid UI blocking
+            def change_model_background():
+                success = self.change_model_size(new_size)
+                if success:
+                    print(f"✅ [UI] Successfully changed to {new_size} model")
+                else:
+                    print(f"❌ [UI] Failed to change to {new_size} model")
+                    # Revert UI selection on failure
+                    self.model_size.set(self.whisper_model_size)
+            
+            # Run model change in thread pool to avoid blocking UI
+            self.io_executor.submit(change_model_background)
+    
+    def show_model_info(self):
+        """
+        Show information about available Whisper model sizes.
+        """
+        current_model = self.model_size.get()
+        device_info = f"Device: {self.whisper_device.upper()}"
+        
+        info_text = f"Current Model: {current_model.title()}\n{device_info}\n\n"
+        info_text += "Available Models:\n\n"
+        
+        for size in ["tiny", "base", "small", "medium"]:
+            info = self._get_model_info(size)
+            marker = "→ " if size == current_model else "   "
+            info_text += f"{marker}{size.title()}: {info['description']}\n"
+            info_text += f"     Parameters: {info['params']}, Memory: {info['vram']}\n"
+            info_text += f"     Speed: {info['speed']}, Accuracy: {info['accuracy']}\n\n"
+        
+        info_text += "Recommendations:\n"
+        info_text += "• Tiny: Fastest, use for low-end hardware\n"
+        info_text += "• Base: Good balance for most users\n"
+        info_text += "• Small: Better accuracy for important content\n"
+        info_text += "• Medium: Best quality, requires powerful hardware"
+        
+        messagebox.showinfo("Whisper Model Information", info_text)
     
     def schedule_subtitle_clear(self):
         """
@@ -1181,9 +1471,10 @@ class SubtitleApp:
         """
         print("🧁 [AUDIO] Processing audio frames...")
         
-        # Check if Whisper model is available
-        if self.whisper_model is None:
-            print("❌ [AUDIO] Whisper model not available. Skipping transcription.")
+        # Get Whisper model (lazy loading)
+        whisper_model = self.get_whisper_model()
+        if whisper_model is None:
+            print("❌ [AUDIO] Failed to load Whisper model. Skipping transcription.")
             return
         
         # Voice Activity Detection - check if audio has sufficient volume
@@ -1238,7 +1529,7 @@ class SubtitleApp:
                 
                 # Run Whisper transcription
                 print("🤖 [AUDIO] Calling whisper transcribe...")
-                result = self.whisper_model.transcribe(tmp_file.name)
+                result = whisper_model.transcribe(tmp_file.name)
                 text = result["text"].strip()  # Extract transcribed text
                 print(f"📝 [AUDIO] Whisper transcription: '{text}'")
                 
