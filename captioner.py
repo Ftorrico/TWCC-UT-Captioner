@@ -24,6 +24,23 @@ import numpy as np  # Numerical operations for audio data
 from cryptography.fernet import Fernet  # Symmetric encryption for API key storage
 from openai import OpenAI  # OpenAI API client for translation services
 from concurrent.futures import ThreadPoolExecutor  # Thread pool for audio processing
+from scipy.signal import butter, lfilter  # For band-pass filtering
+from scipy.io import wavfile  # For reading/writing filtered audio
+
+# Audio filtering functions
+def butter_bandpass(lowcut, highcut, fs, order=5):
+    """Create a band-pass filter for isolating speech frequencies."""
+    nyquist = 0.5 * fs
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    b, a = butter(order, [low, high], btype='band')
+    return b, a
+
+def bandpass_filter(data, lowcut, highcut, fs, order=5):
+    """Apply band-pass filter to audio data."""
+    b, a = butter_bandpass(lowcut, highcut, fs, order=order)
+    y = lfilter(b, a, data)
+    return y
 
 class SettingsDialog:
     """
@@ -1153,6 +1170,13 @@ class SubtitleApp:
             print(f"📂 [AUDIO] Temporary wav file created: {tmp_file.name}")
             
             try:
+                # Apply band-pass filtering to isolate speech frequencies
+                print("🔊 [AUDIO] Applying band-pass filter for speech enhancement...")
+                sample_rate, audio_data = wavfile.read(tmp_file.name)
+                filtered_audio = bandpass_filter(audio_data, 300.0, 3000.0, sample_rate)
+                wavfile.write(tmp_file.name, sample_rate, np.int16(filtered_audio))
+                print("✅ [AUDIO] Band-pass filtering completed")
+                
                 # Run Whisper transcription
                 print("🤖 [AUDIO] Calling whisper transcribe...")
                 result = self.whisper_model.transcribe(tmp_file.name)
